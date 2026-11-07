@@ -16,7 +16,7 @@ import inspect
 import json
 from pathlib import Path
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, DeferredToolRequests, DeferredToolResults
 from pydantic_ai.exceptions import ModelHTTPError
 from fastmcp import Client
 from pydantic_ai.mcp import MCPToolset, StdioTransport
@@ -38,11 +38,22 @@ INSTRUCTIONS = """\
 """
 
 # モデルは実行時に渡す（テストではAPIを呼ばない TestModel に差し替えるため）
-agent = Agent(instructions=INSTRUCTIONS)
+agent = Agent(
+    instructions=(
+        INSTRUCTIONS
+        + "\n- 学習内容や進捗を記録するよう頼まれたら、まず get_learning_log_context で"
+        "answer.md を確認する。今回の利用者の依頼と、この実行中に見える会話・ツール結果を"
+        "もとに記録をまとめ、非公開の内部思考過程は記録しない。"
+        "CLIが保存前に承認を確認するため、自然文で承認を尋ねず、その内容で"
+        "save_learning_log を呼ぶ。"
+    ),
+    output_type=[str, DeferredToolRequests],
+)
 agent.tool_plain(tools.search_glossary)
 agent.tool_plain(tools.get_lecture_summary)
-
-# TODO(第3回 演習): tools.py に make_quiz を作り、ここで登録しよう
+agent.tool_plain(tools.make_quiz)
+agent.tool_plain(tools.get_learning_log_context)
+agent.tool_plain(tools.save_learning_log, requires_approval=True)
 
 # 第5回: 使う MCP サーバーの設定ファイル。Claude Desktop や Cursor と同じ "mcpServers" 形式
 MCP_CONFIG = Path(__file__).resolve().parent / "mcp_servers.json"
@@ -109,6 +120,45 @@ def print_trace(result) -> None:
     print(f"[usage] {result.usage}")
 
 
+def request_tool_approvals(requests: DeferredToolRequests) -> DeferredToolResults:
+    approvals: dict[str, bool] = {}
+    for call in requests.approvals:
+        print(f"\n承認が必要なツール: {call.tool_name}")
+        print(f"実行内容: {json.dumps(call.args, ensure_ascii=False)}")
+        response = input("実行を承認しますか？ [y/N]: ")
+        approvals[call.tool_call_id] = response.strip().lower() in {"y", "yes", "はい"}
+    return requests.build_results(approvals=approvals)
+
+
+def is_learning_log_save_request(question: str) -> bool:
+    normalized = question.casefold()
+    mentions_log = any(
+        phrase in normalized
+        for phrase in ("学習記録", "学習ログ", "learning log", "learning_log")
+    )
+    requests_save = any(phrase in normalized for phrase in ("保存", "save"))
+    rejects_save = any(
+        phrase in normalized
+        for phrase in ("保存しない", "保存不要", "保存は不要", "don't save", "do not save")
+    )
+    return mentions_log and requests_save and not rejects_save
+
+
+def approve_and_save_learning_log(content: str) -> str | None:
+    print("\nモデルが作成した学習記録案:")
+    print(content)
+    try:
+        response = input("この内容を learning_log/ に保存しますか？ [y/N]: ")
+    except EOFError:
+        print("標準入力から確認できなかったため、保存を中止しました。")
+        return None
+
+    if response.strip().lower() not in {"y", "yes", "はい"}:
+        print("保存を中止しました。")
+        return None
+    return tools.save_learning_log(content)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="学習支援エージェントに質問する")
     parser.add_argument("question", nargs="?")
@@ -128,13 +178,34 @@ def main() -> None:
     if args.mcp:
         print("[tools] MCP サーバー（app/mcp_servers.json）")
     try:
-        result = target.run_sync(args.question, model=build_model())
+        model = build_model()
+        result = target.run_sync(args.question, model=model)
+        locally_saved_log = None
+        save_request_handled = False
+        if isinstance(result.output, DeferredToolRequests):
+            deferred_results = request_tool_approvals(result.output)
+            result = target.run_sync(
+                message_history=result.all_messages(),
+                deferred_tool_results=deferred_results,
+                model=model,
+            )
+        elif not args.mcp and is_learning_log_save_request(args.question):
+            save_request_handled = True
+            locally_saved_log = approve_and_save_learning_log(result.output)
     except ModelHTTPError as e:
         print(api_error_message(e.status_code, str(e.body)[:200]))
         raise SystemExit(1)
-    print(result.output)
+    if locally_saved_log:
+        print(locally_saved_log)
+    elif save_request_handled:
+        print("学習記録は保存されませんでした。")
+    else:
+        print(result.output)
     if args.trace:
         print_trace(result)
+        if locally_saved_log:
+            print("[tool call]   save_learning_log(<approved draft>)")
+            print(f"[tool return] {locally_saved_log}")
 
 
 if __name__ == "__main__":
