@@ -125,7 +125,7 @@ def open_index(path: Path):
 
 
 def search(query: str) -> list[dict]:
-    """質問を埋め込み、近いページを最大RAG_TOP_K件返す。"""
+    """質問を埋め込み、近いページと同じ資料内の前後ページを返す。"""
     if not isinstance(query, str) or not query.strip():
         raise ValueError("検索語が空です。")
     with open_index(RAG_DB) as db:
@@ -135,7 +135,40 @@ def search(query: str) -> list[dict]:
                    vec_distance_cosine(embedding, ?) AS distance
             FROM chunks ORDER BY distance, page_id LIMIT ?
         """, (sqlite_vec.serialize_float32(vector), RAG_TOP_K))
-        return [dict(row) for row in rows]
+        return add_neighbor_pages([dict(row) for row in rows])
+
+
+def add_neighbor_pages(results: list[dict], source: Path = RAG_SOURCE) -> list[dict]:
+    """検索結果の前後1ページを追加し、重複ページを1件にまとめる。"""
+    pages = load_pages(source)
+    pages_by_document_and_number = {
+        (page["document_id"], page["page"]): page for page in pages
+    }
+
+    expanded = []
+    included = set()
+    for result in results:
+        page_id = result["page_id"]
+        if page_id not in included:
+            expanded.append(result)
+            included.add(page_id)
+
+    for result in results:
+        page_id = result["page_id"]
+        for offset, position in ((-1, "previous"), (1, "next")):
+            neighbor = pages_by_document_and_number.get(
+                (result["document_id"], result["page"] + offset)
+            )
+            if neighbor is None or neighbor["page_id"] in included:
+                continue
+            expanded.append({
+                **neighbor,
+                "retrieval": "neighbor",
+                "neighbor_of": page_id,
+                "relative_position": position,
+            })
+            included.add(neighbor["page_id"])
+    return expanded
 
 
 def search_graph(query: str) -> dict:
@@ -151,7 +184,10 @@ def search_graph(query: str) -> dict:
             adjacent[a].add(b)
             adjacent[b].add(a)
 
-    seeds = [hit for hit in search(query) if hit["page_id"] in pages][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
+    seeds = [
+        hit for hit in search(query)
+        if hit["page_id"] in pages and "distance" in hit
+    ][:min(GRAPH_START_K, GRAPH_MAX_RESULTS)]
     seed_ids = {seed["page_id"] for seed in seeds}
     results, candidates = [], {}
     for rank, seed in enumerate(seeds):
@@ -204,6 +240,8 @@ if __name__ == "__main__":
     args = parser.parse_args()
     for i, result in enumerate(search(args.query), 1):
         print(f"\n{'=' * 60}\n検索結果 {i}\n{'=' * 60}")
+        if result.get("retrieval") == "neighbor":
+            print(f"取得区分: 前後ページ（{result['relative_position']}）")
         print(f"講義: {result['document_title']}")
         print(f"章: {result['section']}")
         print(f"タイトル: {result['title']}")
